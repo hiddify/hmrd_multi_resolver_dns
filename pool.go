@@ -3,6 +3,7 @@ package multidns
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -91,10 +92,13 @@ func (p *pool) candidates() []*resolverState {
 		sortByLatency(healthy)
 		sortByLatency(limited)
 	case LBWeighted:
-		// Weighted is approximated by sorting by weight desc then rotating.
-		sortByWeightDesc(healthy)
-		sortByWeightDesc(limited)
-		rotate(healthy, int(p.rrIndex.Add(1)))
+		// Real weighted selection: each candidate is picked with
+		// probability proportional to its Weight. Weight == 0 means the
+		// resolver is a fallback (only used if the weighted draw misses).
+		// The remaining candidates fan out behind the chosen primary in a
+		// random order so failover is also weighted.
+		shuffleWeighted(healthy)
+		shuffleWeighted(limited)
 	default: // round-robin
 		rotate(healthy, int(p.rrIndex.Add(1)))
 	}
@@ -108,20 +112,57 @@ func (p *pool) candidates() []*resolverState {
 func sortByLatency(rs []*resolverState) {
 	sort.SliceStable(rs, func(i, j int) bool {
 		li, lj := rs[i].latencyEWMA(), rs[j].latencyEWMA()
-		if li == 0 {
+		// Unmeasured resolvers (EWMA == 0) sort *first* so they are
+		// definitely sampled at least once. Otherwise, since Resolve
+		// returns on the first success, an established slow resolver
+		// would forever shadow a freshly-added fast one.
+		switch {
+		case li == 0 && lj == 0:
 			return false
-		}
-		if lj == 0 {
+		case li == 0:
 			return true
+		case lj == 0:
+			return false
 		}
 		return li < lj
 	})
 }
 
-func sortByWeightDesc(rs []*resolverState) {
-	sort.SliceStable(rs, func(i, j int) bool {
-		return rs[i].cfg.Weight > rs[j].cfg.Weight
-	})
+// shuffleWeighted reorders rs in place such that the first element is chosen
+// with probability proportional to Weight (Weight 0 ⇒ pure fallback, only
+// reached if every weighted candidate fails). After picking the first slot,
+// the same procedure is applied to the remainder, so failover order is also
+// weighted. This replaces the previous sort+rotate which gave every resolver
+// the first attempt equally often regardless of weight.
+func shuffleWeighted(rs []*resolverState) {
+	for i := 0; i < len(rs); i++ {
+		// Sum weights for the unselected suffix.
+		var total int
+		for j := i; j < len(rs); j++ {
+			w := rs[j].cfg.Weight
+			if w < 0 {
+				w = 0
+			}
+			total += w
+		}
+		// If every remaining candidate has weight 0, leave their order
+		// alone (they're all equivalent fallbacks).
+		if total == 0 {
+			return
+		}
+		pick := rand.Intn(total) //nolint:gosec // not security-sensitive
+		for j := i; j < len(rs); j++ {
+			w := rs[j].cfg.Weight
+			if w < 0 {
+				w = 0
+			}
+			if pick < w {
+				rs[i], rs[j] = rs[j], rs[i]
+				break
+			}
+			pick -= w
+		}
+	}
 }
 
 func rotate(rs []*resolverState, by int) {
@@ -172,20 +213,18 @@ func (p *pool) resolve(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 		}
 	}
 
-	// If every candidate was throttled, force one through (ignore the bucket)
-	// so callers aren't stranded by aggressive AIMD.
+	// If every candidate was throttled, force *one* through (ignore the
+	// bucket) so callers aren't stranded by aggressive AIMD. Crucially we
+	// only force the first candidate — looping over all of them here would
+	// amplify traffic by N× under heavy rate-limiting and defeat the AIMD
+	// design entirely.
 	if !everSent && len(candidates) > 0 && ctx.Err() == nil {
-		for _, c := range candidates {
-			if ctx.Err() != nil {
-				break
-			}
-			resp, err, ok := p.attempt(ctx, c, q)
-			if ok {
-				return resp, nil
-			}
-			if err != nil {
-				lastErr = err
-			}
+		resp, err, ok := p.attempt(ctx, candidates[0], q)
+		if ok {
+			return resp, nil
+		}
+		if err != nil {
+			lastErr = err
 		}
 	}
 
@@ -201,6 +240,17 @@ func (p *pool) attempt(ctx context.Context, c *resolverState, q *dns.Msg) (*dns.
 	resp, err := c.up.Exchange(attemptCtx, q)
 	cancel()
 	latency := time.Since(start)
+
+	// If the caller's context was *cancelled* (not deadlined) we must not
+	// charge this attempt against the resolver. Many transports surface
+	// caller cancellation as an i/o timeout, which classify would otherwise
+	// route to failTimeout and eventually drive a healthy resolver to the
+	// down state. Distinguishing here, where we still have access to the
+	// parent ctx, is the only reliable place.
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return nil, ctx.Err(), false
+	}
+
 	kind := classify(resp, err)
 	c.record(time.Now(), kind, latency, q)
 	if kind == failNone {
