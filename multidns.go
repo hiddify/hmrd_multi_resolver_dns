@@ -61,6 +61,14 @@ func (m *Manager) AddResolver(cfg ResolverConfig) (string, error) {
 	if cfg.Name == "" {
 		cfg.Name = string(cfg.Protocol) + "://" + cfg.Address
 	}
+	// Normalize the per-attempt timeout *before* we hand cfg to newUpstream
+	// and resolverState. Leaving cfg.Timeout==0 stranded on resolverState
+	// would defeat failover: pool.attempt's capContext would inherit only
+	// the overall ctx deadline, letting one hung resolver burn the whole
+	// budget.
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = m.opts.DefaultResolverTimeout
+	}
 	// Build the upstream before grabbing the lock so we don't block Close
 	// behind any per-protocol initialization (today this is non-blocking, but
 	// the contract is friendlier this way).

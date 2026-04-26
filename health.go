@@ -49,6 +49,12 @@ const (
 // in the right bucket.
 func classify(resp *dns.Msg, err error) failKind {
 	if err != nil {
+		// Caller-side cancellation is not the resolver's fault — never
+		// charge consecutiveFails for it, otherwise N caller cancels would
+		// trip a healthy resolver into the down state.
+		if errors.Is(err, context.Canceled) {
+			return failBadResponse
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			return failTimeout
 		}
