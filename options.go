@@ -52,7 +52,12 @@ type Options struct {
 	RateLimitFloorRPM  int
 	RateLimitUncapRPM  int
 	RateLimitAdditive  int
-	Logger             Logger
+	// DefaultResolverTimeout is the per-attempt cap applied to a resolver
+	// when its ResolverConfig.Timeout is unset. Defaults to 2s. This exists
+	// so a single hung upstream cannot consume the entire DefaultDeadline
+	// before failover kicks in.
+	DefaultResolverTimeout time.Duration
+	Logger                 Logger
 }
 
 // Logger is the minimal logging surface; defaults to a no-op. Embedders
@@ -89,6 +94,9 @@ func (o *Options) applyDefaults() {
 	}
 	if o.RateLimitAdditive <= 0 {
 		o.RateLimitAdditive = 5
+	}
+	if o.DefaultResolverTimeout <= 0 {
+		o.DefaultResolverTimeout = 2 * time.Second
 	}
 	if o.Logger == nil {
 		o.Logger = nopLogger{}

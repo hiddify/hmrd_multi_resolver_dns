@@ -110,6 +110,18 @@ func (u *dnsClientUpstream) Exchange(ctx context.Context, q *dns.Msg) (*dns.Msg,
 	}
 	dconn := &dns.Conn{Conn: c}
 	defer dconn.Close()
+	// Honor the query's EDNS0 UDP buffer size when the caller advertised
+	// one; otherwise dns.Conn.ReadMsg caps UDP reads at MinMsgSize (512),
+	// which would silently truncate large responses on the custom-dialer
+	// path. The non-custom path goes through dns.Client which does this
+	// for us.
+	if u.client.Net == "udp" {
+		if opt := q.IsEdns0(); opt != nil {
+			if size := opt.UDPSize(); size >= dns.MinMsgSize {
+				dconn.UDPSize = size
+			}
+		}
+	}
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.SetDeadline(dl)
 	} else if u.client.Timeout > 0 {
