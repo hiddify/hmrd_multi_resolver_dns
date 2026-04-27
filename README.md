@@ -49,6 +49,7 @@ first-class DNS proxy with per-query semantics.
 | Dynamic `AddResolver` / `RemoveResolver` at runtime | `multidns.go` |
 | Custom `DialFunc` injection on every transport | `resolver.go` |
 | Optional UDP+TCP DNS server listener | `server.go` |
+| `net.PacketConn` surface for DNS-tunnel integrations | `packetconn.go` |
 
 ## Install
 
@@ -125,6 +126,25 @@ go run ./example \
     -upstream doh://https://cloudflare-dns.com/dns-query \
     -stats 5s
 ```
+
+## Usage — as a `net.PacketConn` for DNS-tunnel protocols
+
+DNS-tunnel protocols like [dnstt](https://github.com/net2share/vaydns) (used by hiddify) speak raw DNS wire format to a recursive resolver and care most about *delivery reliability* — if the resolver they're using gets rate-limited or blocked, the whole tunnel stalls. The library exposes its smart pool as a `net.PacketConn` so it can drop in wherever such a protocol expects one:
+
+```go
+mgr := multidns.New(multidns.Options{ /* ... */ })
+mgr.AddResolver( /* recursive resolver A */ )
+mgr.AddResolver( /* recursive resolver B */ )
+mgr.AddResolver( /* recursive resolver C */ )
+
+conn := mgr.PacketConn()                // implements net.PacketConn
+defer conn.Close()                      // does NOT close mgr — caller owns mgr
+
+// hand `conn` to the tunnel/protocol that wants a net.PacketConn
+tunnel.SetResolverConn(conn)
+```
+
+Semantics: `WriteTo(buf, _)` unpacks `buf` as a DNS query and dispatches it asynchronously through the pool (smart selection, AIMD throttling, recovery probing all apply). The response — when one comes — surfaces on the next `ReadFrom`. `SetReadDeadline` / `SetWriteDeadline` are honored. Closing the conn does not close the underlying Manager, so direct `Resolve` calls and other PacketConns can keep using the same pool.
 
 ## Usage — embedded with a custom Dialer
 
