@@ -39,6 +39,10 @@ type Manager struct {
 	probeCtx    context.Context
 	probeCancel context.CancelFunc
 	probeWG     sync.WaitGroup
+
+	// local is non-nil when this Manager was built via StartLocal. Close
+	// then also tears down the bundled UDP+TCP listener.
+	local *localListener
 }
 
 // New constructs a Manager. The returned manager is ready for AddResolver
@@ -154,7 +158,8 @@ func (m *Manager) Resolve(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 	return m.pool.resolve(ctx, q)
 }
 
-// Close stops all probers and closes every upstream. Subsequent calls are
+// Close stops all probers, closes every upstream, and shuts the bundled
+// local listener if one was started via StartLocal. Subsequent calls are
 // no-ops.
 func (m *Manager) Close() error {
 	m.mu.Lock()
@@ -163,7 +168,15 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closed = true
+	local := m.local
 	m.mu.Unlock()
+
+	var firstErr error
+	if local != nil {
+		if err := local.shutdown(); err != nil {
+			firstErr = err
+		}
+	}
 
 	m.probeCancel()
 	m.probeWG.Wait()
@@ -171,5 +184,5 @@ func (m *Manager) Close() error {
 	for _, r := range m.pool.snapshot() {
 		_ = r.up.Close()
 	}
-	return nil
+	return firstErr
 }
